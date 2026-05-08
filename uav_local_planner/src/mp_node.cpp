@@ -157,8 +157,8 @@ public:
     cfg.num_az_pitched    = declare_parameter("num_az_pitched", 18);
 
     // Collision
-    cfg.collision_radius  = declare_parameter("collision_radius", 0.45);
-    cfg.min_clearance     = declare_parameter("min_clearance",    0.6);
+    cfg.collision_radius  = declare_parameter("collision_radius", 0.75);
+    cfg.min_clearance     = declare_parameter("min_clearance",    1.0);
 
     // Speed
     cfg.max_speed         = declare_parameter("max_speed",  2.5);
@@ -189,7 +189,18 @@ public:
     orbit_.progress_min   = declare_parameter("orbit_progress_min",   0.3);
     orbit_.ignore_radius  = declare_parameter("orbit_ignore_radius",  0.3);
 
-    double rate_hz = declare_parameter("update_rate_hz", 20.0);
+    rate_hz_ = declare_parameter("update_rate_hz", 20.0);
+
+    // Slew-rate limiting
+    max_accel_ = declare_parameter("max_accel", 0.75);
+
+    // Pessimistic obstacle distance filter
+    cfg.pessimistic_window = declare_parameter("pessimistic_window", 10);
+
+    // Recovery cooldown
+    double recovery_duration_sec = declare_parameter("recovery_duration_sec", 2.0);
+    cfg.recovery_max_speed = declare_parameter("recovery_max_speed", 0.5);
+    cfg.recovery_duration_cycles = static_cast<int>(recovery_duration_sec * rate_hz_);
 
     planner_ = std::make_unique<uav_local_planner::MotionPrimitives>(cfg);
 
@@ -199,7 +210,7 @@ public:
         planner_->numHorizPrims(),
         cfg.num_az_horizontal, cfg.num_curvatures,
         planner_->numPitchedPrims(),
-        rate_hz,
+        rate_hz_,
         stall_.no_improve_window, stall_.progress_min, stall_.ignore_radius,
         orbit_.yaw_threshold * 180.0 / M_PI, orbit_.progress_min, orbit_.ignore_radius);
 
@@ -244,9 +255,11 @@ public:
     mission_sub_ = create_subscription<std_msgs::msg::Bool>(
         "/uav/mission_complete", rclcpp::QoS(10),
         [this](const std_msgs::msg::Bool::SharedPtr msg) {
-          std::lock_guard<std::mutex> lk(wp_mutex_);
-          have_waypoint_ = false;
-          if (msg->data) { planner_->reset(); stall_.reset(); orbit_.reset(); }
+          if (msg->data) {
+            std::lock_guard<std::mutex> lk(wp_mutex_);
+            have_waypoint_ = false;
+            planner_->reset(); stall_.reset(); orbit_.reset();
+          }
         });
 
     // ── Publishers ───────────────────────────────────────────────────────
@@ -256,7 +269,7 @@ public:
 
     // ── Timer ────────────────────────────────────────────────────────────
     timer_ = create_wall_timer(
-        std::chrono::duration<double>(1.0 / rate_hz),
+        std::chrono::duration<double>(1.0 / rate_hz_),
         std::bind(&MPNode::update, this));
   }
 
@@ -349,10 +362,15 @@ private:
     if (result.estop) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 1000,
           "E-STOP: obstacle within %.2fm", result.closest_obstacle_dist);
+      prev_cmd_ = Eigen::Vector3d::Zero();  // reset for recovery ramp
     } else {
-      cmd.twist.linear.x = result.velocity.x();
-      cmd.twist.linear.y = result.velocity.y();
-      cmd.twist.linear.z = result.velocity.z();
+      // Slew-rate limiting: clamp velocity change per cycle
+      const double max_dv = max_accel_ / rate_hz_;
+      Eigen::Vector3d target(result.velocity.x(), result.velocity.y(), result.velocity.z());
+      cmd.twist.linear.x = std::clamp(target.x(), prev_cmd_.x() - max_dv, prev_cmd_.x() + max_dv);
+      cmd.twist.linear.y = std::clamp(target.y(), prev_cmd_.y() - max_dv, prev_cmd_.y() + max_dv);
+      cmd.twist.linear.z = std::clamp(target.z(), prev_cmd_.z() - max_dv, prev_cmd_.z() + max_dv);
+      prev_cmd_ = Eigen::Vector3d(cmd.twist.linear.x, cmd.twist.linear.y, cmd.twist.linear.z);
     }
     cmd_pub_->publish(cmd);
 
@@ -360,6 +378,8 @@ private:
     auto bs = planner_->bypassState();
     if (result.estop) {
       status.data = "ESTOP";
+    } else if (planner_->inRecovery()) {
+      status.data = "RECOVERING";
     } else if (result.obstacle_detected) {
       if (bs == uav_local_planner::BypassState::LEFT)       status.data = "AVOIDING_L";
       else if (bs == uav_local_planner::BypassState::RIGHT) status.data = "AVOIDING_R";
@@ -397,6 +417,9 @@ private:
   std::unique_ptr<uav_local_planner::MotionPrimitives> planner_;
   StallDetector stall_;
   OrbitDetector orbit_;
+  Eigen::Vector3d prev_cmd_{0, 0, 0};
+  double max_accel_{0.75};
+  double rate_hz_{20.0};
 
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> cloud_;
   Eigen::Vector3d pos_{0, 0, 0}, waypoint_{0, 0, 0};

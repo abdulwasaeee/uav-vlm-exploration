@@ -18,6 +18,7 @@ namespace uav_local_planner {
 MotionPrimitives::MotionPrimitives(const MPConfig& cfg) : cfg_(cfg)
 {
   point_buf_.resize(cfg_.history_capacity);
+  recent_obs_dists_.assign(cfg_.pessimistic_window, std::numeric_limits<double>::max());
   buildPrimitives();
 }
 
@@ -29,6 +30,10 @@ void MotionPrimitives::reset()
   bypass_state_            = BypassState::NONE;
   bypass_hold_cycles_      = 0;
   prev_obstacle_detected_  = false;
+  obs_dist_buf_idx_        = 0;
+  recovery_cycles_remaining_ = 0;
+  recent_obs_dists_.assign(cfg_.pessimistic_window,
+                           std::numeric_limits<double>::max());
 }
 
 // ── Primitive generation ──────────────────────────────────────────────────
@@ -170,6 +175,15 @@ MPResult MotionPrimitives::update(
     if (d < result.closest_obstacle_dist) result.closest_obstacle_dist = d;
   }
 
+  // Pessimistic temporal-min filter: smooths out high-frequency obstacle
+  // distance flicker when the drone yaws between thin obstacles.
+  {
+    recent_obs_dists_[obs_dist_buf_idx_] = result.closest_obstacle_dist;
+    obs_dist_buf_idx_ = (obs_dist_buf_idx_ + 1) % cfg_.pessimistic_window;
+    result.closest_obstacle_dist = *std::min_element(
+        recent_obs_dists_.begin(), recent_obs_dists_.end());
+  }
+
   // Hysteresis: engage at arc_length, disengage at arc_length × factor.
   // Prevents AVOIDING→NOMINAL flicker when obs_dist oscillates at the boundary.
   {
@@ -198,8 +212,12 @@ MPResult MotionPrimitives::update(
   // ── 3. E-stop ──────────────────────────────────────────────────────────
   if (result.closest_obstacle_dist < cfg_.min_clearance) {
     result.estop = true;
+    recovery_cycles_remaining_ = cfg_.recovery_duration_cycles;
     return result;
   }
+
+  // Decrement recovery timer — after ESTOP has cleared
+  if (recovery_cycles_remaining_ > 0) --recovery_cycles_remaining_;
 
   // ── 4. Collision check — horizontal primitives ────────────────────────
   const int nh = static_cast<int>(horiz_prims_.size());
@@ -464,13 +482,19 @@ double MotionPrimitives::pointToSegmentDist(
 // ── Adaptive speed ────────────────────────────────────────────────────────
 double MotionPrimitives::adaptiveSpeed(double closest_dist, double valid_frac) const
 {
-  // Distance-based ramp: full speed at arc_length, min at min_clearance.
+  // Quadratic distance ramp: biases speed toward the low end in the
+  // "caution zone" between min_clearance and arc_length.
   // Starting the ramp at the full detection range (not arc_length/2) means
   // the drone is already slowing when it first sees an obstacle at 2 m.
   const double d_high = cfg_.arc_length;
   const double d_low  = cfg_.min_clearance;
   const double t_dist = std::clamp((closest_dist - d_low) / (d_high - d_low), 0.0, 1.0);
-  const double speed_dist    = cfg_.min_speed + t_dist * (cfg_.max_speed - cfg_.min_speed);
+
+  // During recovery after ESTOP, cap the effective max speed
+  const double eff_max_speed = (recovery_cycles_remaining_ > 0)
+      ? cfg_.recovery_max_speed : cfg_.max_speed;
+
+  const double speed_dist    = cfg_.min_speed + (t_dist * t_dist) * (eff_max_speed - cfg_.min_speed);
 
   // Density-based ramp: full speed when all primitives clear, min when all blocked
   const double speed_density = cfg_.min_speed + valid_frac * (cfg_.max_speed - cfg_.min_speed);

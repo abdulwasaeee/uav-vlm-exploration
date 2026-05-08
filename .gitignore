@@ -26,6 +26,7 @@ __pycache__/
 
 # ROS 2 bag recordings
 bags/
+uav_local_planner/*.md
 
 # OS
 .DS_Store

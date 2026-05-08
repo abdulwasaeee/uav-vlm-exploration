@@ -27,7 +27,7 @@ def generate_launch_description():
             output='screen',
             parameters=[{
                 'acceptance_radius':       1.0,
-                'final_acceptance_radius': 0.8,
+                'final_acceptance_radius': 0.25,
                 'replan_deviation':        2.0,
                 'publish_rate_hz':         20.0,
             }],

@@ -69,10 +69,6 @@ private:
     reset_msg.data = false;
     complete_pub_->publish(reset_msg);
 
-    // Small delay so setpoint publisher can reset have_cmd_ before
-    // VFH3D starts publishing new commands
-    rclcpp::sleep_for(std::chrono::milliseconds(200));
-
     path_         = msg->poses;
     wp_idx_       = 0;
     mission_done_ = false;

@@ -15,14 +15,15 @@ mp_node:
     num_az_pitched: 18
 
     # ── Collision geometry ────────────────────────────────────────────────
-    collision_radius: 0.45       # m  — robot radius (0.30) + safety margin (0.15)
-    min_clearance:    0.6        # m  — e-stop trigger distance
+    collision_radius: 0.75       # m  — robot radius (0.30) + safety margin (0.45)
+    min_clearance:    1.0        # m  — e-stop trigger distance
 
     # ── Speed limits ─────────────────────────────────���────────────────────
     max_speed: 1.5               # m/s  horizontal ceiling
     min_speed: 0.2               # m/s  floor when near obstacle
     max_vz:    1.0               # m/s  vertical ceiling
     alt_kp:    0.8               # altitude P-gain (vz = alt_kp × height_error)
+    max_accel: 0.75              # m/s²  slew-rate limit on velocity changes
 
     # ── Direction scoring weights ─────────────────────────────────────────
     # cost = w_goal × Δangle_to_goal + w_prev × Δangle_to_prev + w_pos × pos_norm
@@ -44,9 +45,19 @@ mp_node:
 
     # ── Temporal point buffer ────────────────────────────��────────────────
     # Circular FIFO in base_link frame. Covers sensor blind spots during yaw.
-    # Memory ≈ history_capacity × 12 bytes  (default: 2048 × 12 = 24 KB)
-    history_capacity:  2048      # max stored points
-    history_subsample: 4         # keep 1-in-N from each incoming cloud
+    # Memory ≈ history_capacity × 12 bytes  (default: 16384 × 12 = 192 KB)
+    history_capacity:  16384     # max stored points
+    history_subsample: 2         # keep 1-in-N from each incoming cloud
+
+    # ── Pessimistic obstacle distance filter ────────────────────────────────
+    # Temporal-min window over closest_obstacle_dist; smooths high-frequency
+    # flicker when the drone yaws between thin obstacles.
+    pessimistic_window: 10       # cycles (0.5 s at 20 Hz)
+
+    # ── Recovery cooldown ──────────────────────────────────────────────────
+    # After ESTOP clears, enter RECOVERING state with a reduced speed cap.
+    recovery_duration_sec: 2.0   # seconds of cooldown
+    recovery_max_speed: 0.5      # m/s  speed cap during RECOVERING
 
     # ── Stall detection ───────────────────────────────────────────────────
     # Tracks the drone's best-ever distance to the goal since the last waypoint.
@@ -68,7 +79,7 @@ mp_node:
     # Accumulates yaw change; if the drone rotates past orbit_yaw_threshold
     # without making orbit_progress_min metres of goal progress → safety hover.
     # Ignored when within orbit_ignore_radius of the goal.
-    orbit_yaw_threshold:  270.0  # degrees of cumulative yaw before orbit fires
+    orbit_yaw_threshold:  4.712  # radians of cumulative yaw before orbit fires (270°)
     orbit_progress_min:   0.3    # metres of goal progress that reset the accumulator
     orbit_ignore_radius:  0.3    # suppress orbit check when already this close (m)
 

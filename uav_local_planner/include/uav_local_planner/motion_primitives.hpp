@@ -20,8 +20,8 @@ struct MPConfig {
   int    num_az_pitched    = 18;    // azimuth directions per pitched layer
 
   // ── Collision geometry ───────────────────────────────────────────────
-  double collision_radius  = 0.45;  // m — robot radius + safety margin
-  double min_clearance     = 0.6;   // m — e-stop distance
+  double collision_radius  = 0.75;  // m — robot radius + safety margin
+  double min_clearance     = 1.0;   // m — e-stop distance
 
   // ── Speed limits ─────────────────────────────────────────────────────
   double max_speed         = 2.5;   // m/s horizontal
@@ -46,11 +46,22 @@ struct MPConfig {
   // side fully blocked) always overrides this timer.
   int    bypass_min_hold_cycles = 60;
 
+  // ── Slew-rate limiting ───────────────────────────────────────────────
+  double max_accel = 0.75;          // m/s² — max velocity change per second
+
+  // ── Pessimistic obstacle distance filter ─────────────────────────────
+  int    pessimistic_window = 10;   // cycles — temporal-min window (0.5 s at 20 Hz)
+
+  // ── Recovery cooldown ────────────────────────────────────────────────
+  double recovery_duration_sec = 2.0;  // seconds of cooldown after ESTOP
+  int    recovery_duration_cycles = 40; // cycles = duration_sec × 20 Hz (set by node)
+  double recovery_max_speed    = 0.5;  // m/s cap during RECOVERING state
+
   // ── Temporal point buffer ────────────────────────────────────────────
   // Points stored in base_link frame. Primary benefit: recovering blind spots
   // during yaw manoeuvres (translation drift is acceptable for short windows).
-  int    history_capacity  = 2048;  // max buffered points from past frames
-  int    history_subsample = 4;     // keep 1-in-N points from each new cloud
+  int    history_capacity  = 16384; // max buffered points from past frames
+  int    history_subsample = 2;     // keep 1-in-N points from each new cloud
 };
 
 struct MPResult {
@@ -84,6 +95,7 @@ public:
   int numHorizPrims() const { return static_cast<int>(horiz_prims_.size()); }
   int numPitchedPrims() const { return static_cast<int>(pitched_prims_.size()); }
   BypassState bypassState() const { return bypass_state_; }
+  bool inRecovery() const { return recovery_cycles_remaining_ > 0; }
 
 private:
   // ── Pre-computed arc geometry ────────────────────────────────────────
@@ -134,6 +146,13 @@ private:
   BypassState bypass_state_{BypassState::NONE};
   int  bypass_hold_cycles_{0};       // cycles elapsed since bypass engaged
   bool prev_obstacle_detected_{false};
+
+  // Pessimistic obstacle distance filter
+  std::vector<double> recent_obs_dists_;
+  int obs_dist_buf_idx_{0};
+
+  // Recovery cooldown
+  int recovery_cycles_remaining_{0};  // decremented each non-ESTOP cycle
 };
 
 }  // namespace uav_local_planner
