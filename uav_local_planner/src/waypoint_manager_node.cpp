@@ -28,6 +28,7 @@ public:
     acceptance_radius_ = declare_parameter("acceptance_radius", 0.4);
     final_acceptance_radius_ = declare_parameter("final_acceptance_radius", 0.25);
     replan_deviation_  = declare_parameter("replan_deviation",  2.0);
+    enable_replan_     = declare_parameter("enable_replan",     false);
     publish_rate_hz_   = declare_parameter("publish_rate_hz",   20.0);
 
     // ── Subscribers ──────────────────────────────────────────────────
@@ -127,7 +128,7 @@ private:
           drone_y_ - pose.pose.position.y);
       min_dist = std::min(min_dist, d);
     }
-    if (min_dist > replan_deviation_) {
+    if (enable_replan_ && min_dist > replan_deviation_) {
       RCLCPP_WARN(get_logger(),
           "Deviation %.2fm > %.2fm — requesting replan", min_dist, replan_deviation_);
       requestReplan();
@@ -170,6 +171,7 @@ private:
 
   // Params
   double acceptance_radius_, final_acceptance_radius_, replan_deviation_, publish_rate_hz_;
+  bool   enable_replan_;
 
   rclcpp::Subscription<nav_msgs::msg::Path>::SharedPtr        path_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr    odom_sub_;

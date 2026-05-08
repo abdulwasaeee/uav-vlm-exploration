@@ -32,6 +32,19 @@ struct MPConfig {
   // ── Scoring weights ──────────────────────────────────────────────────
   double w_goal            = 3.0;   // angular cost toward goal direction
   double w_prev            = 2.0;   // angular cost toward previous primitive
+  double w_pos             = 2.0;   // positional cost — reward closing distance to goal
+
+  // ── Obstacle detection persistence ──────────────────────────────────
+  // Once obstacle_detected goes true, it stays true until obs_dist exceeds
+  // arc_length * obstacle_hysteresis_factor.  Prevents AVOIDING→NOMINAL
+  // flicker when the obstacle sits right at the detection boundary.
+  double obstacle_hysteresis_factor = 1.3;  // disengage at arc_length * 1.3
+
+  // ── Bypass commitment ─────────────────────────────────────────────────
+  // Minimum planner cycles to hold bypass_state before checking the exit
+  // condition.  At 20 Hz, 60 cycles = 3 s.  The safety fallback (bypass
+  // side fully blocked) always overrides this timer.
+  int    bypass_min_hold_cycles = 60;
 
   // ── Temporal point buffer ────────────────────────────────────────────
   // Points stored in base_link frame. Primary benefit: recovering blind spots
@@ -47,6 +60,8 @@ struct MPResult {
   double closest_obstacle_dist;
   int    best_primitive_idx;        // index into horiz_prims_, -1 if none
 };
+
+enum class BypassState { NONE, LEFT, RIGHT };
 
 class MotionPrimitives {
 public:
@@ -68,6 +83,7 @@ public:
   // Read-only access for diagnostics
   int numHorizPrims() const { return static_cast<int>(horiz_prims_.size()); }
   int numPitchedPrims() const { return static_cast<int>(pitched_prims_.size()); }
+  BypassState bypassState() const { return bypass_state_; }
 
 private:
   // ── Pre-computed arc geometry ────────────────────────────────────────
@@ -115,6 +131,9 @@ private:
   int buf_fill_{0};
 
   int prev_best_{-1};
+  BypassState bypass_state_{BypassState::NONE};
+  int  bypass_hold_cycles_{0};       // cycles elapsed since bypass engaged
+  bool prev_obstacle_detected_{false};
 };
 
 }  // namespace uav_local_planner

@@ -23,9 +23,12 @@ MotionPrimitives::MotionPrimitives(const MPConfig& cfg) : cfg_(cfg)
 
 void MotionPrimitives::reset()
 {
-  prev_best_  = -1;
-  write_head_ = 0;
-  buf_fill_   = 0;
+  prev_best_               = -1;
+  write_head_              = 0;
+  buf_fill_                = 0;
+  bypass_state_            = BypassState::NONE;
+  bypass_hold_cycles_      = 0;
+  prev_obstacle_detected_  = false;
 }
 
 // ── Primitive generation ──────────────────────────────────────────────────
@@ -167,7 +170,15 @@ MPResult MotionPrimitives::update(
     if (d < result.closest_obstacle_dist) result.closest_obstacle_dist = d;
   }
 
-  result.obstacle_detected = result.closest_obstacle_dist < L;
+  // Hysteresis: engage at arc_length, disengage at arc_length × factor.
+  // Prevents AVOIDING→NOMINAL flicker when obs_dist oscillates at the boundary.
+  {
+    const bool  raw_det   = result.closest_obstacle_dist < L;
+    const double disengage = L * cfg_.obstacle_hysteresis_factor;
+    result.obstacle_detected = raw_det ||
+        (prev_obstacle_detected_ && result.closest_obstacle_dist < disengage);
+    prev_obstacle_detected_ = result.obstacle_detected;
+  }
 
   // Pitched layers: one filtered list per elevation angle
   const int num_layers = static_cast<int>(cfg_.elevation_angles_deg.size());
@@ -247,24 +258,114 @@ MPResult MotionPrimitives::update(
   const double upper_frac = upper_total > 0 ? static_cast<double>(upper_valid) / upper_total : 1.0;
   const double lower_frac = lower_total > 0 ? static_cast<double>(lower_valid) / lower_total : 1.0;
 
-  // ── 6. Score valid horizontal primitives ──────────────────────────────
-  // Goal direction in base_link frame (rotate map-frame goal by -yaw)
+  // ── 6. Goal direction in base_link frame ──────────────────────────────
   const double cy = std::cos(drone_yaw), sy = std::sin(drone_yaw);
   Eigen::Vector3d goal_map(waypoint.x() - drone_pos.x(),
                             waypoint.y() - drone_pos.y(), 0.0);
   if (goal_map.norm() < 1e-3) goal_map = Eigen::Vector3d(1, 0, 0);
   goal_map.normalize();
 
-  // Rotate map-frame goal direction into base_link frame (rotate by -yaw)
   const double gx_base =  cy * goal_map.x() + sy * goal_map.y();
   const double gy_base = -sy * goal_map.x() + cy * goal_map.y();
   const double goal_az_base = std::atan2(gy_base, gx_base);
+
+  // ── 7. Bypass state machine ───────────────────────────────────────────
+  // Trigger: fewer than 2 valid primitives within ±25° of goal direction.
+  //
+  // Side selection and filtering use goal-relative azimuth (terminal_az - goal_az_base)
+  // rather than body-frame Y, making the committed bypass direction invariant to drone
+  // yaw.  (Bug fix V3: previous body-frame check rotated with the drone during an orbit.)
+  //
+  // The dead-code second trigger `best_d_goal > marginal_angle` has been removed;
+  // it could only fire when near_goal_valid == 0 (first condition already sufficient).
+  const double block_angle_rad = 25.0 * M_PI / 180.0;
+  int near_goal_valid = 0;
+  for (int i = 0; i < nh; ++i) {
+    if (!valid_h[i]) continue;
+    if (std::abs(normalizeAngle(horiz_prims_[i].terminal_az - goal_az_base)) < block_angle_rad)
+      ++near_goal_valid;
+  }
+
+  bool goal_blocked = (near_goal_valid < 2);
+
+  // Enter bypass: commit to whichever side (left/right of the goal direction) has more
+  // valid primitives.  "left" = positive goal-relative azimuth (CCW of goal in world frame).
+  if (goal_blocked && bypass_state_ == BypassState::NONE) {
+    int left_valid = 0, right_valid = 0;
+    for (int i = 0; i < nh; ++i) {
+      if (!valid_h[i]) continue;
+      double rel = normalizeAngle(horiz_prims_[i].terminal_az - goal_az_base);
+      if (rel > 0.05) left_valid++;
+      else if (rel < -0.05) right_valid++;
+    }
+    if (left_valid > 0 || right_valid > 0) {
+      bypass_state_       = (left_valid >= right_valid) ? BypassState::LEFT : BypassState::RIGHT;
+      bypass_hold_cycles_ = 0;  // start commitment timer
+    }
+  }
+
+  // Build filtered valid set for scoring
+  std::vector<bool> valid_score = valid_h;
+  if (bypass_state_ != BypassState::NONE) {
+    ++bypass_hold_cycles_;
+
+    bool keep_left = (bypass_state_ == BypassState::LEFT);
+    for (int i = 0; i < nh; ++i) {
+      if (!valid_score[i]) continue;
+      // Goal-relative sign: positive = left of goal (CCW), negative = right (CW)
+      bool prim_left = normalizeAngle(horiz_prims_[i].terminal_az - goal_az_base) > 0.05;
+      if (prim_left != keep_left) valid_score[i] = false;
+    }
+
+    // Exit bypass when a near-straight primitive toward the goal becomes valid.
+    // Only checked after the minimum commitment window has elapsed so the drone
+    // cannot abort bypass the moment the path transiently clears.
+    if (bypass_hold_cycles_ >= cfg_.bypass_min_hold_cycles) {
+      for (int i = 0; i < nh; ++i) {
+        if (!valid_h[i]) continue;
+        if (std::abs(horiz_prims_[i].curvature) > 0.08) continue;
+        double daz = std::abs(normalizeAngle(
+            horiz_prims_[i].terminal_az - goal_az_base));
+        if (daz < block_angle_rad) {
+          bypass_state_ = BypassState::NONE;
+          valid_score = valid_h;
+          break;
+        }
+      }
+    }
+
+    // Safety fallback: if the committed bypass side has no valid primitives at
+    // all, revert immediately regardless of the hold timer.
+    int filtered_count = 0;
+    for (bool v : valid_score) if (v) ++filtered_count;
+    if (filtered_count == 0) {
+      bypass_state_ = BypassState::NONE;
+      valid_score = valid_h;
+    }
+  }
+
+  // ── 8. Score valid horizontal primitives ─────────────────────────────
+  // Pre-compute endpoint-to-goal distances for positional cost term.
+  std::vector<double> end_dist(nh, 1e9);
+  double best_end_dist = 1e9;
+  for (int i = 0; i < nh; ++i) {
+    if (!valid_score[i]) continue;
+    const auto& ep = horiz_prims_[i].end_point;
+    const double ex = drone_pos.x() + cy * ep.x() - sy * ep.y();
+    const double ey = drone_pos.y() + sy * ep.x() + cy * ep.y();
+    const double d = std::hypot(waypoint.x() - ex, waypoint.y() - ey);
+    end_dist[i] = d;
+    if (d < best_end_dist) best_end_dist = d;
+  }
+
+  // Guard against degenerate case (all blocked or best_end_dist ≈ 0)
+  if (best_end_dist < 1e-6) best_end_dist = 1e-6;
 
   double best_cost = std::numeric_limits<double>::max();
   int    best_idx  = -1;
 
   for (int i = 0; i < nh; ++i) {
-    if (!valid_h[i]) continue;
+    if (!valid_score[i]) continue;
 
     const double d_goal = std::abs(normalizeAngle(
         horiz_prims_[i].terminal_az - goal_az_base));
@@ -275,7 +376,14 @@ MPResult MotionPrimitives::update(
           horiz_prims_[i].terminal_az - horiz_prims_[prev_best_].terminal_az));
     }
 
-    const double cost = cfg_.w_goal * d_goal + cfg_.w_prev * d_prev;
+    // Positional cost: normalise against best end-distance so the primitive
+    // that ends closest to the goal gets cost=1.0×w_pos, others pay a penalty
+    // proportional to how much farther they end from the goal.
+    const double pos_norm = end_dist[i] / best_end_dist;
+
+    const double cost = cfg_.w_goal * d_goal
+                      + cfg_.w_prev * d_prev
+                      + cfg_.w_pos  * pos_norm;
     if (cost < best_cost) {
       best_cost = cost;
       best_idx  = i;
@@ -290,11 +398,11 @@ MPResult MotionPrimitives::update(
   prev_best_ = best_idx;
   result.best_primitive_idx = best_idx;
 
-  // ── 7. Adaptive speed — min of distance-ramp and density-ramp ─────────
+  // ── 9. Adaptive speed — min of distance-ramp and density-ramp ─────────
   const double valid_frac = static_cast<double>(valid_h_count) / nh;
   const double speed = adaptiveSpeed(result.closest_obstacle_dist, valid_frac);
 
-  // ── 8. Velocity in map frame ──────────────────────────────────────────
+  // ── 10. Velocity in map frame ─────────────────────────────────────────
   // Use INITIAL heading of selected arc (velocity direction at t=0)
   const double vx_base = std::cos(horiz_prims_[best_idx].az_angle) * speed;
   const double vy_base = std::sin(horiz_prims_[best_idx].az_angle) * speed;
@@ -356,8 +464,10 @@ double MotionPrimitives::pointToSegmentDist(
 // ── Adaptive speed ────────────────────────────────────────────────────────
 double MotionPrimitives::adaptiveSpeed(double closest_dist, double valid_frac) const
 {
-  // Distance-based ramp: full speed at arc_length/2, min at min_clearance
-  const double d_high = cfg_.arc_length / 2.0;
+  // Distance-based ramp: full speed at arc_length, min at min_clearance.
+  // Starting the ramp at the full detection range (not arc_length/2) means
+  // the drone is already slowing when it first sees an obstacle at 2 m.
+  const double d_high = cfg_.arc_length;
   const double d_low  = cfg_.min_clearance;
   const double t_dist = std::clamp((closest_dist - d_low) / (d_high - d_low), 0.0, 1.0);
   const double speed_dist    = cfg_.min_speed + t_dist * (cfg_.max_speed - cfg_.min_speed);

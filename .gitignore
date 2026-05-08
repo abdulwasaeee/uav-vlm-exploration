@@ -24,5 +24,8 @@ __pycache__/
 # VSCode
 .vscode/
 
+# ROS 2 bag recordings
+bags/
+
 # OS
 .DS_Store

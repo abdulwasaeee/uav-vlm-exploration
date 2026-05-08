@@ -19,6 +19,7 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
 #include <pcl/point_cloud.h>
@@ -31,54 +32,108 @@
 #include <mutex>
 #include <cmath>
 
+// ── Orbit detector ──────────────────────────────────────────────────────────
+// Detects circular motion without goal progress by accumulating yaw change.
+// Complements the stall detector: stall catches lack of progress, orbit
+// catches spinning-in-place specifically.  Both trigger a safety hover.
+
+namespace {
+double normalizeAngle(double a) {
+  while (a >  M_PI) a -= 2.0 * M_PI;
+  while (a <= -M_PI) a += 2.0 * M_PI;
+  return a;
+}
+}  // namespace
+
+struct OrbitDetector {
+  double yaw_threshold  = 1.5 * M_PI;  // fire after 270° of accumulated yaw
+  double progress_min   = 0.3;         // must get this much closer than best-ever to reset
+  double ignore_radius  = 1.2;         // skip check if already this close to goal
+  double yaw_accumulator{0.0};
+  double min_dist{1e9};                // best-ever distance — resets only on true progress
+  double prev_yaw_{0.0};
+  bool   prev_valid_{false};
+  bool   orbiting{false};
+
+  void reset() {
+    yaw_accumulator = 0.0; min_dist = 1e9; prev_valid_ = false; orbiting = false;
+  }
+
+  void update(double dist_to_goal, double yaw)
+  {
+    orbiting = false;
+    if (dist_to_goal < ignore_radius) { reset(); return; }
+    if (!prev_valid_) { prev_yaw_ = yaw; prev_valid_ = true; return; }
+
+    double dyaw = std::abs(normalizeAngle(yaw - prev_yaw_));
+    prev_yaw_ = yaw;
+    yaw_accumulator += dyaw;
+
+    // Compute progress BEFORE updating min_dist so the delta is non-zero.
+    // (Bug fix V3: previous code updated min_dist first, making progress always 0.)
+    double progress = min_dist - dist_to_goal;
+    if (dist_to_goal < min_dist) min_dist = dist_to_goal;
+
+    if (progress > progress_min)
+      yaw_accumulator = 0.0;
+
+    orbiting = (yaw_accumulator > yaw_threshold);
+  }
+};
+
 // ── Goal-progress stall detector ──────────────────────────────────────────
-// Stall condition: the drone has not made meaningful progress toward the goal
-// over a sliding window, regardless of how much ground it covered.
+// Tracks the best-ever (minimum) distance to goal since the last reset.
+// STALLED fires when that best distance has not improved by progress_min
+// within no_improve_window seconds.
 //
-// This correctly handles both failure modes:
-//   - Tight orbit: bounding box is large but dist_to_goal never shrinks → stall
-//   - Slow approach near obstacle: dist_to_goal steadily shrinks → no stall
-//   - VIO drift on hover: dist_to_goal unchanged but have_waypoint is false
-//     so the detector never runs
+// Why the old sliding-window design failed:
+//   When the drone oscillates near an obstacle (e.g. reaching 0.12 m then
+//   bouncing to 1.75 m repeatedly), each 3-second window sees a fresh approach
+//   that looks like 1.2 m of "progress".  initial_dist_in_window - min = 1.2 m
+//   > 0.3 m → never stalled, even after 60 s of bouncing.
 //
-// progress = initial_dist_to_goal − best (minimum) dist_to_goal seen in window
-// If progress < progress_min over the full window → STALLED.
+//   Additionally, stall_ignore_radius = 1.0 m suppressed the detector for 92%
+//   of all samples when the drone oscillated below 1.0 m.
+//
+// New design: track global best_dist since last reset.  The clock resets only
+// when the drone beats best_dist by progress_min.  Bouncing between 0.12 m and
+// 1.75 m never beats 0.12 m − 0.15 m = −0.03 m, so the clock runs to timeout.
 struct StallDetector {
-  struct Sample { rclcpp::Time t; double dist_to_goal; };
+  double no_improve_window = 20.0;  // fire after this many seconds without improvement
+  double progress_min      = 0.15;  // dist reduction required to reset the clock (m)
+  double ignore_radius     = 0.25;  // suppress when already this close to goal (m)
+  bool   stalled           = false;
 
-  double window_sec    = 3.0;   // sliding window length
-  double progress_min  = 0.3;   // must close dist_to_goal by this much (metres)
-  double ignore_radius = 1.0;   // skip check if already this close to goal
-  int    min_samples   = 45;    // fill ~window before firing (20 Hz × 2.25 s)
-  bool   stalled       = false;
+  double bestDist()        const { return best_dist_;      }
+  double sinceImprove()    const { return since_improve_;  }
 
-  std::deque<Sample> buf;
+  void reset() { best_dist_ = 1e9; last_improve_t_ = -1.0; since_improve_ = 0.0; stalled = false; }
 
-  void reset() { buf.clear(); stalled = false; }
-
-  // Pass current XY distance to goal each cycle.
   void update(double dist_to_goal, rclcpp::Time now)
   {
-    // Already at goal — waypoint_manager should fire mission_complete soon
-    if (dist_to_goal < ignore_radius) { stalled = false; return; }
+    if (dist_to_goal < ignore_radius) { reset(); return; }
 
-    buf.push_back({now, dist_to_goal});
+    const double t = now.seconds();
+    if (last_improve_t_ < 0.0) {
+      best_dist_      = dist_to_goal;
+      last_improve_t_ = t;
+      stalled         = false;
+      return;
+    }
 
-    // Prune entries older than the window
-    while (!buf.empty() &&
-           (now - buf.front().t).seconds() > window_sec)
-      buf.pop_front();
+    if (dist_to_goal < best_dist_ - progress_min) {
+      best_dist_      = dist_to_goal;
+      last_improve_t_ = t;
+    }
 
-    if (static_cast<int>(buf.size()) < min_samples) { stalled = false; return; }
-
-    // Best progress = how much closer to goal we got at any point in the window
-    const double initial_dist = buf.front().dist_to_goal;
-    double min_dist = initial_dist;
-    for (const auto& s : buf)
-      min_dist = std::min(min_dist, s.dist_to_goal);
-
-    stalled = ((initial_dist - min_dist) < progress_min);
+    since_improve_ = t - last_improve_t_;
+    stalled        = (since_improve_ > no_improve_window);
   }
+
+private:
+  double best_dist_     {1e9};
+  double last_improve_t_{-1.0};
+  double since_improve_ {0.0};
 };
 
 // ─────────────────────────────────────────────────────────────────────────
@@ -114,16 +169,25 @@ public:
     // Scoring
     cfg.w_goal            = declare_parameter("w_goal", 3.0);
     cfg.w_prev            = declare_parameter("w_prev", 2.0);
+    cfg.w_pos             = declare_parameter("w_pos",  2.0);
+
+    // Obstacle detection persistence
+    cfg.obstacle_hysteresis_factor = declare_parameter("obstacle_hysteresis_factor", 1.3);
+    cfg.bypass_min_hold_cycles     = declare_parameter("bypass_min_hold_cycles",     60);
 
     // History buffer
     cfg.history_capacity  = declare_parameter("history_capacity",  2048);
     cfg.history_subsample = declare_parameter("history_subsample", 4);
 
     // Stall detection
-    stall_.window_sec    = declare_parameter("stall_window_sec",   3.0);
-    stall_.progress_min  = declare_parameter("stall_progress_min", 0.3);
-    stall_.ignore_radius = declare_parameter("stall_ignore_radius",1.0);
-    stall_.min_samples   = declare_parameter("stall_min_samples",  45);
+    stall_.no_improve_window = declare_parameter("stall_no_improve_window", 20.0);
+    stall_.progress_min      = declare_parameter("stall_progress_min",       0.15);
+    stall_.ignore_radius     = declare_parameter("stall_ignore_radius",      0.25);
+
+    // Orbit detection
+    orbit_.yaw_threshold  = declare_parameter("orbit_yaw_threshold",  1.5 * M_PI);
+    orbit_.progress_min   = declare_parameter("orbit_progress_min",   0.3);
+    orbit_.ignore_radius  = declare_parameter("orbit_ignore_radius",  0.3);
 
     double rate_hz = declare_parameter("update_rate_hz", 20.0);
 
@@ -131,12 +195,13 @@ public:
 
     RCLCPP_INFO(get_logger(),
         "MPNode: %d horiz arcs (%d az × %d κ) + %d pitched segments, %.0f Hz | "
-        "stall: %.1fs window / %.2fm progress_min / %.1fm ignore_radius",
+        "stall: %.0fs/%.2fm/%.2fm | orbit: %.0f°/%.2fm/%.2fm",
         planner_->numHorizPrims(),
         cfg.num_az_horizontal, cfg.num_curvatures,
         planner_->numPitchedPrims(),
         rate_hz,
-        stall_.window_sec, stall_.progress_min, stall_.ignore_radius);
+        stall_.no_improve_window, stall_.progress_min, stall_.ignore_radius,
+        orbit_.yaw_threshold * 180.0 / M_PI, orbit_.progress_min, orbit_.ignore_radius);
 
     // ── Subscribers ──────────────────────────────────────────────────────
     cloud_sub_ = create_subscription<sensor_msgs::msg::PointCloud2>(
@@ -173,6 +238,7 @@ public:
           have_waypoint_ = true;
           planner_->reset();
           stall_.reset();   // new waypoint clears stall state
+          orbit_.reset();   // new waypoint clears orbit state
         });
 
     mission_sub_ = create_subscription<std_msgs::msg::Bool>(
@@ -180,12 +246,13 @@ public:
         [this](const std_msgs::msg::Bool::SharedPtr msg) {
           std::lock_guard<std::mutex> lk(wp_mutex_);
           have_waypoint_ = false;
-          if (msg->data) { planner_->reset(); stall_.reset(); }
+          if (msg->data) { planner_->reset(); stall_.reset(); orbit_.reset(); }
         });
 
     // ── Publishers ───────────────────────────────────────────────────────
     cmd_pub_    = create_publisher<geometry_msgs::msg::TwistStamped>("/uav/cmd_vel", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/uav/vfh_status", 10);
+    diag_pub_   = create_publisher<std_msgs::msg::Float64MultiArray>("/uav/mp_diag", 10);
 
     // ── Timer ────────────────────────────────────────────────────────────
     timer_ = create_wall_timer(
@@ -227,15 +294,39 @@ private:
 
     if (stall_.stalled) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-          "STALLED: no progress toward goal (< %.2fm) over %.1fs — hovering. "
+          "STALLED: best approach %.2fm, no %.2fm improvement for %.0fs — hovering. "
           "Send a new waypoint to resume.",
-          stall_.progress_min, stall_.window_sec);
+          stall_.bestDist(), stall_.progress_min, stall_.sinceImprove());
       status.data = "STALLED";
       status_pub_->publish(status);
       geometry_msgs::msg::TwistStamped cmd;
       cmd.header.stamp    = get_clock()->now();
       cmd.header.frame_id = "map";
-      cmd_pub_->publish(cmd);   // zero velocity
+      cmd_pub_->publish(cmd);
+      std_msgs::msg::Float64MultiArray diag;
+      diag.data = {dist_to_goal, yaw, orbit_.yaw_accumulator,
+                   0.0, 1.0, 0.0, stall_.bestDist(), stall_.sinceImprove(), 0.0, 0.0, 0.0, 0.0};
+      diag_pub_->publish(diag);
+      return;
+    }
+
+    // ── Orbit check ──────────────────────────────────────────────────────
+    orbit_.update(dist_to_goal, yaw);
+    if (orbit_.orbiting) {
+      RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
+          "ORBIT DETECTED: accumulated %.0f° yaw change with < %.2fm goal progress — hovering. "
+          "Send a new waypoint to resume.",
+          orbit_.yaw_accumulator * 180.0 / M_PI, orbit_.progress_min);
+      status.data = "ORBITING";
+      status_pub_->publish(status);
+      geometry_msgs::msg::TwistStamped cmd;
+      cmd.header.stamp    = get_clock()->now();
+      cmd.header.frame_id = "map";
+      cmd_pub_->publish(cmd);
+      std_msgs::msg::Float64MultiArray diag;
+      diag.data = {dist_to_goal, yaw, orbit_.yaw_accumulator,
+                   1.0, 0.0, 0.0, stall_.bestDist(), stall_.sinceImprove(), 0.0, 0.0, 0.0, 0.0};
+      diag_pub_->publish(diag);
       return;
     }
 
@@ -266,13 +357,46 @@ private:
     cmd_pub_->publish(cmd);
 
     // ── Publish status ───────────────────────────────────────────────────
-    status.data = result.estop            ? "ESTOP"    :
-                  result.obstacle_detected ? "AVOIDING" : "NOMINAL";
+    auto bs = planner_->bypassState();
+    if (result.estop) {
+      status.data = "ESTOP";
+    } else if (result.obstacle_detected) {
+      if (bs == uav_local_planner::BypassState::LEFT)       status.data = "AVOIDING_L";
+      else if (bs == uav_local_planner::BypassState::RIGHT) status.data = "AVOIDING_R";
+      else                                                  status.data = "AVOIDING";
+    } else {
+      status.data = "NOMINAL";
+    }
     status_pub_->publish(status);
+
+    // ── Publish diagnostics ──────────────────────────────────────────────
+    // Layout: [dist_to_goal, yaw, yaw_accum, orbiting, stalled, bypass_state,
+    //          stall_best_dist, stall_since_improve, closest_obstacle,
+    //          best_prim_idx, estop, obstacle_detected]
+    {
+      const double bs_val = (bs == uav_local_planner::BypassState::LEFT)  ? 1.0 :
+                            (bs == uav_local_planner::BypassState::RIGHT) ? 2.0 : 0.0;
+      std_msgs::msg::Float64MultiArray diag;
+      diag.data = {
+          dist_to_goal, yaw,
+          orbit_.yaw_accumulator,
+          orbit_.orbiting          ? 1.0 : 0.0,
+          stall_.stalled           ? 1.0 : 0.0,
+          bs_val,
+          stall_.bestDist(),
+          stall_.sinceImprove(),
+          result.closest_obstacle_dist,
+          static_cast<double>(result.best_primitive_idx),
+          result.estop             ? 1.0 : 0.0,
+          result.obstacle_detected ? 1.0 : 0.0
+      };
+      diag_pub_->publish(diag);
+    }
   }
 
   std::unique_ptr<uav_local_planner::MotionPrimitives> planner_;
   StallDetector stall_;
+  OrbitDetector orbit_;
 
   std::shared_ptr<pcl::PointCloud<pcl::PointXYZ>> cloud_;
   Eigen::Vector3d pos_{0, 0, 0}, waypoint_{0, 0, 0};
@@ -285,9 +409,10 @@ private:
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr          odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr              mission_sub_;
-  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr    cmd_pub_;
-  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr               status_pub_;
-  rclcpp::TimerBase::SharedPtr                                       timer_;
+  rclcpp::Publisher<geometry_msgs::msg::TwistStamped>::SharedPtr       cmd_pub_;
+  rclcpp::Publisher<std_msgs::msg::String>::SharedPtr                  status_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr       diag_pub_;
+  rclcpp::TimerBase::SharedPtr                                          timer_;
 };
 
 int main(int argc, char** argv)

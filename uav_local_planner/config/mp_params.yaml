@@ -19,15 +19,28 @@ mp_node:
     min_clearance:    0.6        # m  — e-stop trigger distance
 
     # ── Speed limits ─────────────────────────────────���────────────────────
-    max_speed: 2.5               # m/s  horizontal ceiling
+    max_speed: 1.5               # m/s  horizontal ceiling
     min_speed: 0.2               # m/s  floor when near obstacle
     max_vz:    1.0               # m/s  vertical ceiling
     alt_kp:    0.8               # altitude P-gain (vz = alt_kp × height_error)
 
     # ── Direction scoring weights ─────────────────────────────────────────
-    # cost = w_goal × Δangle_to_goal + w_prev × Δangle_to_prev_primitive
+    # cost = w_goal × Δangle_to_goal + w_prev × Δangle_to_prev + w_pos × pos_norm
+    #   pos_norm = end_dist_to_goal / best_end_dist  (reward closing distance)
     w_goal: 3.0
     w_prev: 2.0
+    w_pos:  2.0
+
+    # ── Obstacle detection persistence ───────────────────────────────────
+    # obstacle_detected engages when obs_dist < arc_length.
+    # It only clears when obs_dist > arc_length × obstacle_hysteresis_factor,
+    # preventing AVOIDING→NOMINAL flicker when the obstacle sits at the boundary.
+    obstacle_hysteresis_factor: 1.3   # disengage threshold = 2.0 × 1.3 = 2.6 m
+
+    # Minimum planner cycles to hold bypass_state before checking exit condition.
+    # At 20 Hz: 60 cycles = 3 s.  Safety fallback (bypass side fully blocked)
+    # always overrides this regardless of the counter.
+    bypass_min_hold_cycles: 60
 
     # ── Temporal point buffer ────────────────────────────��────────────────
     # Circular FIFO in base_link frame. Covers sensor blind spots during yaw.
@@ -36,15 +49,28 @@ mp_node:
     history_subsample: 4         # keep 1-in-N from each incoming cloud
 
     # ── Stall detection ───────────────────────────────────────────────────
-    # Goal-progress approach: stall fires if the drone hasn't closed the
-    # distance to its goal by stall_progress_min metres within stall_window_sec.
-    # This catches circular orbits of any radius (dist_to_goal stays flat)
-    # without false-triggering on slow-but-genuine obstacle approach (dist
-    # steadily shrinks).  Ignored when drone is already within ignore_radius.
-    stall_window_sec:   3.0  # sliding window length (s)
-    stall_progress_min: 0.3  # must close dist_to_goal by this much (m) or → stall
-    stall_ignore_radius: 1.0 # skip stall check if already this close to goal (m)
-    stall_min_samples:  45   # require ≥ N samples before firing (20 Hz × 2.25 s)
+    # Tracks the drone's best-ever distance to the goal since the last waypoint.
+    # STALLED fires when that best distance has not improved by stall_progress_min
+    # within stall_no_improve_window seconds.
+    #
+    # This catches both:
+    #   (a) Complete stop:  dist never shrinks → timer runs to timeout
+    #   (b) Oscillation near obstacle: drone bounces between 0.12 m and 1.75 m;
+    #       best_ever = 0.12 m never beats 0.12 - 0.15 = -0.03 m → fires after 20 s
+    #
+    # stall_ignore_radius should match the waypoint acceptance radius so that
+    # mission_complete fires before the stall detector can trigger on arrival.
+    stall_no_improve_window: 20.0  # seconds without best-dist improvement → stall
+    stall_progress_min:       0.15 # min dist reduction that resets the clock (m)
+    stall_ignore_radius:      0.25 # suppress detection when already this close (m)
+
+    # ── Orbit detection ───────────────────────────────────────────────────
+    # Accumulates yaw change; if the drone rotates past orbit_yaw_threshold
+    # without making orbit_progress_min metres of goal progress → safety hover.
+    # Ignored when within orbit_ignore_radius of the goal.
+    orbit_yaw_threshold:  270.0  # degrees of cumulative yaw before orbit fires
+    orbit_progress_min:   0.3    # metres of goal progress that reset the accumulator
+    orbit_ignore_radius:  0.3    # suppress orbit check when already this close (m)
 
     # ── Control rate ──────────────────────────────────────────────────────
     update_rate_hz: 20.0
