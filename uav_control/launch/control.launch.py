@@ -9,9 +9,10 @@ def generate_launch_description():
             name='setpoint_publisher',
             output='screen',
             parameters=[{
-                'publish_rate_hz':    20.0,
-                'yaw_speed':          0.5,
-                'hover_on_complete':  True,
+                'publish_rate_hz':       20.0,
+                'yaw_speed':             0.5,
+                'hover_on_complete':     True,
+                'vehicle_status_topic':  '/fmu/out/vehicle_status_v2',
             }],
         ),
     ])

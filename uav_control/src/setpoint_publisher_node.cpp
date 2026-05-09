@@ -79,8 +79,10 @@ public:
         });
 
     // Vehicle status for armed + offboard state
+    auto status_topic = declare_parameter("vehicle_status_topic",
+                                          std::string("/fmu/out/vehicle_status_v2"));
     status_sub_ = create_subscription<px4_msgs::msg::VehicleStatus>(
-        "/fmu/out/vehicle_status_v2", px4_qos,
+        status_topic, px4_qos,
         [this](const px4_msgs::msg::VehicleStatus::SharedPtr msg) {
           armed_        = (msg->arming_state == px4_msgs::msg::VehicleStatus::ARMING_STATE_ARMED);
           in_offboard_  = (msg->nav_state    == px4_msgs::msg::VehicleStatus::NAVIGATION_STATE_OFFBOARD);
