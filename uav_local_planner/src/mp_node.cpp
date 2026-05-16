@@ -19,6 +19,7 @@
 #include <geometry_msgs/msg/point_stamped.hpp>
 #include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/bool.hpp>
+#include <std_msgs/msg/string.hpp>
 #include <std_msgs/msg/float64_multi_array.hpp>
 
 #include <pcl_conversions/pcl_conversions.h>
@@ -262,6 +263,13 @@ public:
           }
         });
 
+    // SPF mission phase — hover during ROTATING
+    phase_sub_ = create_subscription<std_msgs::msg::String>(
+        "/uav/mission_phase", rclcpp::QoS(10),
+        [this](const std_msgs::msg::String::SharedPtr msg) {
+          mission_phase_ = msg->data;
+        });
+
     // ── Publishers ───────────────────────────────────────────────────────
     cmd_pub_    = create_publisher<geometry_msgs::msg::TwistStamped>("/uav/cmd_vel", 10);
     status_pub_ = create_publisher<std_msgs::msg::String>("/uav/vfh_status", 10);
@@ -279,6 +287,20 @@ private:
     if (!have_odom_) return;
 
     std_msgs::msg::String status;
+
+    // During ROTATING phase — hover, let setpoint_publisher handle yaw
+    if (mission_phase_ == "ROTATING") {
+      status.data = "ROTATING";
+      status_pub_->publish(status);
+      geometry_msgs::msg::TwistStamped cmd;
+      cmd.header.stamp    = get_clock()->now();
+      cmd.header.frame_id = "map";
+      cmd.twist.linear.x  = 0.0;
+      cmd.twist.linear.y  = 0.0;
+      cmd.twist.linear.z  = 0.0;
+      cmd_pub_->publish(cmd);
+      return;
+    }
 
     if (!have_waypoint_) {
       status.data = "IDLE";
@@ -428,6 +450,8 @@ private:
 
   std::mutex cloud_mutex_, odom_mutex_, wp_mutex_;
 
+  std::string mission_phase_{"IDLE"};
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr            phase_sub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr   cloud_sub_;
   rclcpp::Subscription<nav_msgs::msg::Odometry>::SharedPtr          odom_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_sub_;

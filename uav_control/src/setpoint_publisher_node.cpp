@@ -27,8 +27,10 @@
 #include <px4_msgs/msg/vehicle_status.hpp>
 #include <px4_msgs/msg/vehicle_local_position.hpp>
 #include <cmath>
+#include <std_msgs/msg/string.hpp>
+#include <geometry_msgs/msg/point_stamped.hpp>
 
-enum class FlightState { STARTUP, TAKEOFF, HOVER, AUTONOMOUS };
+enum class FlightState { STARTUP, TAKEOFF, HOVER, ROTATING, AUTONOMOUS };
 
 class SetpointPublisher : public rclcpp::Node
 {
@@ -40,7 +42,7 @@ public:
     takeoff_height_   = declare_parameter("takeoff_height",   -2.0); // NED negative=up
     takeoff_threshold_= declare_parameter("takeoff_threshold", 0.8); // fraction of height
     startup_delay_s_  = declare_parameter("startup_delay_s",   5.0);
-    cmd_timeout_s_    = declare_parameter("cmd_timeout_s",     0.5);
+    cmd_timeout_s_    = declare_parameter("cmd_timeout_s",     1.0);  // increased for SPF phase transitions
 
     // ── PX4 QoS — matches offboard_controller.py ─────────────────────
     rclcpp::QoS px4_qos(1);
@@ -76,6 +78,9 @@ public:
         [this](const px4_msgs::msg::VehicleOdometry::SharedPtr msg) {
           float w=msg->q[0], x=msg->q[1], y=msg->q[2], z=msg->q[3];
           current_yaw_ned_ = std::atan2(2.0f*(w*z+x*y), 1.0f-2.0f*(y*y+z*z));
+          // Default target yaw = current yaw (updated by SPF orchestrator if needed)
+          if (state_ != FlightState::ROTATING)
+            target_yaw_ned_ = current_yaw_ned_;
         });
 
     // Vehicle status for armed + offboard state
@@ -171,6 +176,13 @@ private:
       case FlightState::HOVER: {
         publishVelocitySetpoint(0.0f, 0.0f, 0.0f, now_us);
 
+        // Transition to ROTATING if mission_phase says so
+        if (mission_phase_ == "ROTATING") {
+          state_ = FlightState::ROTATING;
+          RCLCPP_INFO(get_logger(), "Mission phase ROTATING — entering yaw-only mode");
+          break;
+        }
+
         // Transition to autonomous when VFH3D sends a fresh command
         if (have_cmd_ && !mission_complete_) {
           bool stale = (get_clock()->now() - last_cmd_time_).seconds() > cmd_timeout_s_;
@@ -182,6 +194,41 @@ private:
                 "HOVER: waiting for fresh VFH3D cmd (last was %.1fs ago)",
                 (get_clock()->now() - last_cmd_time_).seconds());
           }
+        }
+        break;
+      }
+
+      case FlightState::ROTATING: {
+        // Yaw-only mode: velocity=0, yaw=target
+        // publishHeartbeat with position=true for stable hover
+        publishHeartbeat(false, true, now_us);
+
+        // Latch hover position on entry
+        if (!rotating_pos_latched_) {
+          rotating_x_ = 0.0f;  // use NaN position — velocity hold
+          rotating_y_ = 0.0f;
+          rotating_z_ = local_z_;
+          rotating_pos_latched_ = true;
+          RCLCPP_INFO(get_logger(), "ROTATING: latched hover position z=%.2f", rotating_z_);
+        }
+
+        // Emit velocity=0 + target yaw — Option A from Shantam's doc
+        px4_msgs::msg::TrajectorySetpoint sp;
+        sp.position  = {std::nanf(""), std::nanf(""), std::nanf("")};
+        sp.velocity  = {0.0f, 0.0f, 0.0f};
+        sp.yaw       = target_yaw_ned_;
+        sp.yawspeed  = 0.0f;
+        sp.timestamp = now_us;
+        setpoint_pub_->publish(sp);
+
+        // Transition out
+        if (mission_phase_ == "TRANSLATING" || mission_phase_ == "COMPLETE") {
+          rotating_pos_latched_ = false;
+          state_ = FlightState::AUTONOMOUS;
+          RCLCPP_INFO(get_logger(), "ROTATING done — switching to AUTONOMOUS");
+        } else if (mission_phase_ == "IDLE") {
+          rotating_pos_latched_ = false;
+          state_ = FlightState::HOVER;
         }
         break;
       }
@@ -278,6 +325,10 @@ private:
 
   // ── State ─────────────────────────────────────────────────────────────
   FlightState state_{FlightState::STARTUP};
+  std::string mission_phase_{"IDLE"};
+  float  target_yaw_ned_{0.0f};
+  bool   rotating_pos_latched_{false};
+  float  rotating_x_{0.0f}, rotating_y_{0.0f}, rotating_z_{0.0f};
 
   double cmd_vx_{0}, cmd_vy_{0}, cmd_vz_{0};
   float  current_yaw_ned_{0.0f};
@@ -300,6 +351,8 @@ private:
   rclcpp::Publisher<px4_msgs::msg::TrajectorySetpoint>::SharedPtr  setpoint_pub_;
   rclcpp::Publisher<px4_msgs::msg::VehicleCommand>::SharedPtr      cmd_pub_;
   rclcpp::Subscription<geometry_msgs::msg::TwistStamped>::SharedPtr cmd_sub_;
+  rclcpp::Subscription<std_msgs::msg::String>::SharedPtr            phase_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr waypoint_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleOdometry>::SharedPtr   odom_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleStatus>::SharedPtr     status_sub_;
   rclcpp::Subscription<px4_msgs::msg::VehicleLocalPosition>::SharedPtr pos_sub_;

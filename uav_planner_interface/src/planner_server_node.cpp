@@ -42,6 +42,8 @@ public:
     cfg.max_altitude      = declare_parameter<double>("max_altitude",      5.0);
     cfg.min_altitude      = declare_parameter<double>("min_altitude",      0.3);
     cfg.max_planning_time = declare_parameter<double>("max_planning_time", 10.0);
+    // SPF direct mode — skip A*, emit one-pose path directly
+    spf_direct_mode_ = declare_parameter<bool>("spf_direct_mode", false);
 
     // ── Load plugin ──────────────────────────────────────────────────
     // Defer initialize() call — shared_from_this() is invalid in constructor.
@@ -153,6 +155,21 @@ private:
       tree_copy = octree_;
     }
 
+    // ── SPF direct mode — skip A*, emit one-pose path ────────────────
+    if (spf_direct_mode_) {
+      RCLCPP_INFO(get_logger(), "[SPF] Direct mode — skipping A*, emitting one-pose path");
+      nav_msgs::msg::Path path;
+      path.header.frame_id = map_frame_;
+      path.header.stamp    = get_clock()->now();
+      path.poses.push_back(gh->get_goal()->target_pose);
+      path_pub_->publish(path);
+      result->global_path  = path;
+      result->result_code  = "SUCCESS";
+      gh->succeed(result);
+      RCLCPP_INFO(get_logger(), "[SPF] Direct path published — 1 pose");
+      return;
+    }
+
     // ── Call planner plugin ───────────────────────────────────────────
     auto feedback_cb = [&](float pct) {
       if (gh->is_canceling()) return;
@@ -222,6 +239,7 @@ private:
   rclcpp::Publisher<nav_msgs::msg::Path>::SharedPtr           path_pub_;
   rclcpp_action::Server<NavigateToGoal>::SharedPtr            action_server_;
 
+  bool spf_direct_mode_{false};
   std::shared_ptr<octomap::OcTree> octree_;
   std::string                      map_frame_{"map"};
   std::mutex                       map_mutex_;

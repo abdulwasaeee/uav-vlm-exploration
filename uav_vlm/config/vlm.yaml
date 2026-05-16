@@ -1,0 +1,8 @@
+vlm_spatial_grounding:
+  ros__parameters:
+    api_model: "gpt-4o"
+    img_width: 1280
+    img_height: 720
+    h_fov: 1.047
+    max_depth_m: 15.0
+    min_depth_m: 0.3

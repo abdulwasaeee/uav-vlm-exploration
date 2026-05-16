@@ -39,10 +39,16 @@ add_executable(px4_odom_bridge src/px4_odom_bridge.cpp)
 ament_target_dependencies(px4_odom_bridge
   rclcpp nav_msgs geometry_msgs tf2 tf2_ros tf2_geometry_msgs px4_msgs)
 
+# stereo_camera_info_publisher
+add_executable(stereo_camera_info_publisher src/stereo_camera_info_publisher.cpp)
+ament_target_dependencies(stereo_camera_info_publisher
+  rclcpp sensor_msgs)
+
 install(TARGETS
     cloud_merge_node
     tf_static_broadcaster
     px4_odom_bridge
+    stereo_camera_info_publisher
   DESTINATION lib/${PROJECT_NAME})
 
 install(DIRECTORY launch

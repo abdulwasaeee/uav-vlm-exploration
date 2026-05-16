@@ -47,12 +47,14 @@ print(f"DB  : {DB_PATH}")
 
 # Known world geometry (indoor_obstacle.sdf)
 POLES = [(7.0, 0.0, 0.12), (7.0, 2.0, 0.12), (7.0, 4.0, 0.12)]  # (x, y, radius)
-GOAL  = (9.0, 0.0, 1.5)
+# GOAL is read from /uav/global_path in the bag (set below after loading)
 
 # Planner params used when bag was recorded
 COLLISION_RADIUS = 0.75
 MIN_CLEARANCE    = 1.0
 ARC_LENGTH       = 2.0
+
+PROCESS_CLOUD = False  # set True to parse cloud frames (slow / OOM on large bags)
 
 # %% [markdown]
 # ## 2 · CDR Reader + Message Parsers
@@ -188,6 +190,23 @@ def parse_bool_msg(buf):
         return False
 
 
+def parse_path(buf):
+    """nav_msgs/Path → list of (x, y, z) for each pose."""
+    try:
+        r = CDRReader(buf)
+        r.i32(); r.u32(); r.string()  # header: stamp + frame_id
+        n_poses = r.u32()
+        poses = []
+        for _ in range(n_poses):
+            r.i32(); r.u32(); r.string()  # pose header: stamp + frame_id
+            x = r.f64(); y = r.f64(); z = r.f64()
+            r.f64(); r.f64(); r.f64(); r.f64()  # orientation (skip)
+            poses.append((x, y, z))
+        return poses
+    except Exception:
+        return []
+
+
 # PointCloud2 datatype codes → (struct format char, byte size)
 _PC2_DT = {1: ('b',1), 2: ('B',1), 3: ('h',2), 4: ('H',2),
            5: ('i',4), 6: ('I',4), 7: ('f',4), 8: ('d',8)}
@@ -317,9 +336,9 @@ cmd_vx    = np.array([r[1] for _, r in _cmd_raw])
 cmd_vy    = np.array([r[2] for _, r in _cmd_raw])
 print(f"CmdVel: {len(cmd_t):4d} samples")
 
-# ── Cloud (optional) ──────────────────────────────────────────────────────
+# ── Cloud (optional — disabled when PROCESS_CLOUD=False) ─────────────────
 cloud_rows = []
-if HAS_CLOUD:
+if HAS_CLOUD and PROCESS_CLOUD:
     tid = topic_info['/drone/tof_merged/points'][0]
     cur.execute(
         "SELECT timestamp, data FROM messages WHERE topic_id=? ORDER BY timestamp", (tid,))
@@ -330,6 +349,25 @@ if HAS_CLOUD:
     npts = [len(r[2]) for r in cloud_rows]
     print(f"Cloud : {len(cloud_rows):4d} frames  pts/frame: "
           f"min={min(npts)} median={int(np.median(npts))} max={max(npts)}")
+else:
+    print(f"Cloud : {'available but skipped (PROCESS_CLOUD=False)' if HAS_CLOUD else 'not in bag'}")
+
+# ── Goal — read from last /uav/global_path message ────────────────────────
+GOAL = None
+if '/uav/global_path' in topic_info:
+    tid = topic_info['/uav/global_path'][0]
+    cur.execute(
+        "SELECT data FROM messages WHERE topic_id=? ORDER BY timestamp DESC LIMIT 1", (tid,))
+    row = cur.fetchone()
+    if row:
+        poses = parse_path(bytes(row[0]))
+        if poses:
+            GOAL = poses[-1]
+if GOAL is None:
+    GOAL = (9.0, 0.0, 1.5)
+    print(f"Goal  : fallback default {GOAL} (no global_path in bag)")
+else:
+    print(f"Goal  : ({GOAL[0]:.2f}, {GOAL[1]:.2f}, {GOAL[2]:.2f})  ← from bag")
 
 # ── Mission complete ──────────────────────────────────────────────────────
 mission_done = False
@@ -377,7 +415,8 @@ gs  = gridspec.GridSpec(4, 1, hspace=0.45)
 # ── Subplot 1: obstacle distance ──────────────────────────────────────────
 ax1 = fig.add_subplot(gs[0])
 shade_status(ax1, t_end)
-ax1.plot(diag_t, D['obs_d'], color='steelblue', lw=1.3, label='obs_d')
+obs_d_plot = np.where(np.isfinite(D['obs_d']), D['obs_d'], np.nan)
+ax1.plot(diag_t, obs_d_plot, color='steelblue', lw=1.3, label='obs_d')
 ax1.axhline(MIN_CLEARANCE,    color='red',    ls='--', lw=1.2, alpha=0.8,
             label=f'min_clearance ({MIN_CLEARANCE}m)')
 ax1.axhline(ARC_LENGTH,       color='orange', ls='--', lw=1.0, alpha=0.7,
@@ -390,7 +429,9 @@ if estop_mask.any():
                 np.full(estop_mask.sum(), 0.05),
                 c='red', s=18, zorder=5, label='ESTOP tick')
 ax1.set_ylabel('Distance (m)')
-ax1.set_ylim(bottom=0, top=min(2.6, D['obs_d'].max() * 1.05))
+_obs_finite = obs_d_plot[np.isfinite(obs_d_plot)]
+_obs_top = min(2.6, float(_obs_finite.max()) * 1.05) if len(_obs_finite) else 2.6
+ax1.set_ylim(bottom=0, top=_obs_top)
 ax1.legend(fontsize=7, loc='upper right', ncol=2)
 ax1.set_title('Closest Obstacle Distance', fontsize=9)
 ax1.grid(True, alpha=0.3)

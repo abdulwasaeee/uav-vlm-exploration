@@ -7,11 +7,14 @@ from launch.conditions import IfCondition
 from launch.substitutions import LaunchConfiguration
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from ament_index_python.packages import get_package_share_directory
+import os
 
 
 def generate_launch_description():
     use_mp             = LaunchConfiguration('use_mp',             default='true')
     with_global_planner = LaunchConfiguration('with_global_planner', default='true')
+    with_vlm            = LaunchConfiguration('with_vlm',            default='false')
+    with_spf            = LaunchConfiguration('with_spf',            default='false')
 
     fusion_dir  = get_package_share_directory('uav_depth_fusion')
     mapping_dir = get_package_share_directory('uav_mapping')
@@ -28,6 +31,12 @@ def generate_launch_description():
         DeclareLaunchArgument(
             'with_global_planner', default_value='true',
             description='Launch OctoMap + A* global planner (required for nav goals)'),
+        DeclareLaunchArgument(
+            'with_vlm', default_value='false',
+            description='Launch VLM spatial grounding + user instruction interface'),
+        DeclareLaunchArgument(
+            'with_spf', default_value='false',
+            description='Launch SPF orchestrator (requires with_vlm:=true)'),
 
         # ── T = 0 s : Sensor fusion ───────────────────────────────────────
         # Must come first: provides /drone/tof_merged/points, /drone/odom, TF tree.
