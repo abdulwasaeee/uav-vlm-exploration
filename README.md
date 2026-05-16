@@ -1,443 +1,403 @@
-
 # UAV VLM Exploration
 
+VLM-enriched UAV exploration and navigation built using:
+
+* PX4 SITL
+* ROS2 Humble
+* Gazebo Harmonic
+
+This project implements:
+
+* **See Point Fly (SPF)** — CoRL 2025
+* **Frontier-Based Exploration (FBE)**
+* Vision-Language-Model-guided autonomous navigation
 
 
-VLM-enriched UAV exploration and navigation built on PX4 SITL + ROS2 Humble + Gazebo Harmonic.
 
+---
 
+# Quick Start
 
-Implements See Point Fly (SPF) (CoRL 2025) with Frontier-Based Exploration (FBE) enriched by Vision-Language Models.
+## 0. Kill Existing Processes
 
-
-
-## Kill Everything
-
-
-
+```bash
 pkill -f "px4|gz|MicroXRCE|ros2|singularity|xterm" 2>/dev/null
-
 sleep 8
+```
 
+---
 
+# 1. Launch Simulation
 
-## Step 1 - Launch Simulation
+```bash
+cd ~/irobot/px4_sim
+bash run_server.sh e1547056
+```
 
+Wait approximately **90 seconds** for all xterms to initialize.
 
+---
 
-cd ~/irobot/px4_sim && bash run_server.sh e1547056
+# 2. Launch Core VLM Navigation Stack
 
+## Terminal A — VLM Interface + User Interaction
 
-
-Wait 90 seconds for all 5 xterms to boot.
-
-
-
-## Step 2 - Launch VLM Navigation
-
-
-
-Terminal A - VLM + User Interface:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 export OPENAI_API_KEY=$OPENAI_API_KEY &&
-
 export OLLAMA_API_KEY=$OLLAMA_API_KEY &&
 
 ros2 launch uav_vlm vlm.launch.py
-
 "
+```
 
+---
 
+## Terminal B — SPF Orchestrator
 
-Terminal B - SPF Orchestrator:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 ros2 launch uav_global_planner spf_orchestrator.launch.py
-
 "
+```
 
+---
 
+## Terminal C — RViz Visualization
 
-Terminal C - RViz:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 export DISPLAY=$DISPLAY &&
-
 rviz2
-
 "
+```
 
+---
 
+# 3. Launch Autonomous Exploration Modules
 
-## Step 3 - Autonomous Exploration
+## Terminal D — Frontier Explorer
 
-
-
-Terminal D - Frontier Explorer:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 ros2 launch uav_exploration explorer.launch.py
-
 "
+```
 
+---
 
+## Terminal E — VLM Frontier Selector
 
-Terminal E - VLM Frontier Selector:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 export OPENAI_API_KEY=$OPENAI_API_KEY &&
 
 python3 ~/irobot/planner_ws/uav_exploration/src/vlm_frontier_selector.py
-
 "
+```
 
+---
 
+## Terminal F — Metrics Logger
 
-Terminal F - Metrics Logger:
-
-
-
+```bash
 singularity exec --nv ~/irobot/uav_stack.sif bash -c "
-
 source /opt/ros/humble/setup.bash &&
-
 source ~/irobot/px4_ros2_ws/install/setup.bash &&
-
 source ~/irobot/planner_ws/install/setup.bash &&
 
 python3 ~/irobot/planner_ws/uav_exploration/src/exploration_metrics.py \
-
   --ros-args -p run_name:=vlm_run
-
 "
+```
 
+---
 
+# VLM User Interface
 
-## VLM Interface Usage
+After launching Terminal A:
 
-
-
-After Terminal A starts you will see:
-
-
-
+```text
 Hi! I am your inspection drone.
-
 How can I help you today?
+```
 
+## Example Commands
 
+```text
+fly to the yellow cylinder
+find the red box
+what do you see
+go forward
+move left 2
+```
 
-You:
+---
 
+# System Architecture
 
-
-Example commands:
-
-You: fly to the yellow cylinder
-
-You: find the red box
-
-You: what do you see
-
-You: go forward
-
-You: move left 2
-
-
-
-## System Architecture
-
-
-
-User types instruction
-
-        |
-
-        v
-
+```text
+User Instruction
+      │
+      ▼
 user_instruction_node
-
-publishes /user/instruction
-
-        |
-
-        v
-
+      │
+Publishes: /user/instruction
+      │
+      ▼
 vlm_spatial_grounding
-
-captures camera + depth image
-
-sends to GPT-4o with instruction
-
-GPT-4o returns 2D pixel (u,v) + depth estimate
-
-pinhole camera model projects to 3D world pose
-
-publishes /spf/target_pose
-
-        |
-
-        v
-
+      │
+Captures RGB + depth image
+Queries GPT-4o
+Returns 2D pixel + depth
+Projects target into 3D world pose
+Publishes: /spf/target_pose
+      │
+      ▼
 spf_orchestrator
-
-receives /spf/target_pose
-
-calls /uav/navigate_to_goal action
-
-publishes /uav/global_planner_status
-
-        |
-
-        v
-
+      │
+Calls navigation action server
+Publishes: /uav/global_planner_status
+      │
+      ▼
 planner_server_node
-
-spf_direct_mode=true skips A* emits one-pose path
-
-publishes /uav/global_path
-
-        |
-
-        v
-
-waypoint_manager_node SPF-D FSM
-
-ROTATING phase: publishes hover wp until yaw aligned
-
-TRANSLATING phase: publishes target wp until reached
-
-COMPLETE: publishes mission_complete
-
-        |
-
-        v
-
+      │
+SPF direct mode skips A*
+Publishes single-pose path
+Publishes: /uav/global_path
+      │
+      ▼
+waypoint_manager_node
+      │
+FSM States:
+- ROTATING
+- TRANSLATING
+- COMPLETE
+      │
+      ▼
 mp_node
+      │
+ROTATING:
+    publishes zero cmd_vel
 
-ROTATING: publishes zero cmd_vel
-
-TRANSLATING: runs motion primitives + obstacle avoidance
-
-publishes /uav/cmd_vel
-
-        |
-
-        v
-
-setpoint_publisher_node SPF-D ROTATING state
-
-ROTATING: velocity=0 yaw=target_yaw
-
-AUTONOMOUS: forwards cmd_vel as velocity
-
-publishes /fmu/in/trajectory_setpoint
-
-        |
-
-        v
-
+TRANSLATING:
+    obstacle avoidance +
+    motion primitives
+      │
+Publishes: /uav/cmd_vel
+      │
+      ▼
+setpoint_publisher_node
+      │
+Publishes:
+    /fmu/in/trajectory_setpoint
+      │
+      ▼
 MicroXRCE-DDS Agent
-
-        |
-
-        v
-
+      │
+      ▼
 PX4 SITL
+      │
+      ▼
+Gazebo Harmonic
+```
 
-        |
+---
 
-        v
+# Benchmark Results
 
-Gazebo Harmonic - drone moves
+| Configuration | Distance | VLM Calls | Time  |
+| ------------- | -------- | --------- | ----- |
+| Pure FBE      | 102.7 m  | 0         | 500 s |
+| FBE + VLM     | 87.46 m  | 36        | 525 s |
 
+### Result
 
+* **14.8% improvement in exploration efficiency**
+* Slight increase in runtime due to VLM inference overhead
 
-## Benchmark Results
+---
 
+# API Speed Comparison
 
+| Model               | Latency           |
+| ------------------- | ----------------- |
+| Ollama gemma3:4b    | 0.69 s            |
+| OpenAI gpt-4o-mini  | 0.95 s            |
+| OpenAI gpt-4o       | 1.09 s            |
+| Ollama gemma4:31b   | 1.31 s            |
+| Ollama gpt-oss:120b | No vision support |
 
-Baseline pure FBE:
+---
 
-Distance: 102.7m
+# Core C++ Modifications
 
-VLM calls: 0
+## `waypoint_manager_node.cpp`
 
-Time: 500s
+Added:
 
+* `SPFPhase` FSM
 
+  * `IDLE`
+  * `ROTATING`
+  * `TRANSLATING`
+  * `COMPLETE`
 
-FBE + VLM:
+New features:
 
-Distance: 87.46m
+* `/uav/mission_phase` publisher
+* Yaw alignment threshold parameter
+* Rotation-first behavior before translation
 
-VLM calls: 36
+---
 
-Time: 525s
+## `mp_node.cpp`
 
-Improvement: 14.8% more efficient
+Added:
 
+* `/uav/mission_phase` subscriber
 
+Behavior:
 
-## API Speed Results
+* `ROTATING` → publishes zero velocity
+* `TRANSLATING` → normal obstacle avoidance
 
+---
 
+## `setpoint_publisher_node.cpp`
 
-Ollama gemma3:4b  - 0.69s  FASTEST used for scans
+Added:
 
-OpenAI gpt-4o-mini - 0.95s
+* `FlightState::ROTATING`
 
-OpenAI gpt-4o    - 1.09s
+Changes:
 
-Ollama gemma4:31b - 1.31s
+* Velocity forced to zero during yaw alignment
+* Increased `cmd_timeout_s`
 
-Ollama gpt-oss:120b - NO VISION SUPPORT
+  * `0.5 → 1.0`
 
+---
 
+## `planner_server_node.cpp`
 
-## C++ Changes Made
+Added:
 
+```cpp
+spf_direct_mode = true
+```
 
+Effect:
 
-waypoint_manager_node.cpp
+* Skips A*
+* Publishes direct single-pose path
 
-Added SPFPhase enum IDLE ROTATING TRANSLATING COMPLETE
+---
 
-Added /uav/mission_phase publisher
+# Known Issues
 
-Added yaw_alignment_threshold_deg parameter default 15 degrees
+## ESTOP Prevents Movement
 
-Added yaw_alignment_hold_cycles parameter default 10 cycles
+**Cause**
 
-FSM rotates first if yaw error exceeds threshold
+```text
+mp_node triggers stop when obstacle distance < 0.47 m
+```
 
+**Workaround**
 
+* Restart simulation
+* Move UAV away from obstacle
 
-mp_node.cpp
+---
 
-Added /uav/mission_phase subscriber
+## Drone Stuck After Mission Completion
 
-During ROTATING publishes zero cmd_vel
+**Cause**
 
-During TRANSLATING normal obstacle avoidance
+```text
+waypoint_manager continues publishing last waypoint
+```
 
+**Workaround**
 
+* Send a new instruction
 
-setpoint_publisher_node.cpp
+---
 
-Added FlightState ROTATING
+## VLM Hallucination
 
-During ROTATING velocity=0 position=NaN yaw=target_yaw
+**Cause**
 
-Increased cmd_timeout_s from 0.5 to 1.0
+```text
+Gazebo lighting affects object recognition
+```
 
+**Workaround**
 
+* Retry from another viewpoint
 
-planner_server_node.cpp
+---
 
-Added spf_direct_mode parameter default true
+## cmd_vel Timeout
 
-Skips A* and emits single pose path directly
+**Cause**
 
+```text
+setpoint_publisher switches back to HOVER after 1 second
+```
 
+**Workaround**
 
-## Known Issues
+* Continuously publish waypoints
 
+---
 
+# References
 
-ESTOP blocks movement
+## SPF Paper
 
-Cause: mp_node stops when obstacle within 0.47m
+[See Point Fly (arXiv)](https://arxiv.org/abs/2509.22653?utm_source=chatgpt.com)
 
-Workaround: restart sim or send drone away
+## Frontier-Based Exploration
 
+```text
+Yamauchi, B. (1997)
+A Frontier-Based Approach for Autonomous Exploration
+```
 
+---
 
-Drone stuck after task complete
+# Authors
 
-Cause: waypoint_manager keeps publishing last waypoint
+### Ahmed (e1547056)
 
-Workaround: send new instruction
+* VLM integration
+* SPF implementation
+* Exploration metrics
 
+### Shantam
 
-
-VLM hallucination
-
-Cause: Gazebo lighting causes misidentification
-
-Workaround: retry from different position
-
-
-
-cmd_vel timeout
-
-Cause: setpoint_publisher reverts to HOVER after 1s
-
-Workaround: continuous waypoint publishing
-
-
-
-## References
-
-
-
-See Point Fly: https://arxiv.org/abs/2509.22653
-
-FBE: Yamauchi 1997
-
-
-
-## Authors
-
-
-
-Ahmed e1547056 - VLM integration SPF implementation exploration metrics
-
-Shantam - System architecture cuVSLAM semantic layer design
-
+* System architecture
+* cuVSLAM semantic layer
+* System design
