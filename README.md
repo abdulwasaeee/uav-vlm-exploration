@@ -320,9 +320,8 @@ Effect:
 
 **Cause**
 
-```text
 mp_node triggers stop when obstacle distance < 0.47 m
-```
+
 
 **Workaround**
 
@@ -335,9 +334,7 @@ mp_node triggers stop when obstacle distance < 0.47 m
 
 **Cause**
 
-```text
 waypoint_manager continues publishing last waypoint
-```
 
 **Workaround**
 
@@ -349,9 +346,7 @@ waypoint_manager continues publishing last waypoint
 
 **Cause**
 
-```text
 Gazebo lighting affects object recognition
-```
 
 **Workaround**
 
@@ -363,9 +358,7 @@ Gazebo lighting affects object recognition
 
 **Cause**
 
-```text
 setpoint_publisher switches back to HOVER after 1 second
-```
 
 **Workaround**
 
