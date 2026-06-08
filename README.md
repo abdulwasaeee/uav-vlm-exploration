@@ -392,5 +392,4 @@ A Frontier-Based Approach for Autonomous Exploration
 ### Shantam
 
 * System architecture
-* cuVSLAM semantic layer
 * System design
